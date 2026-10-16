@@ -2166,6 +2166,488 @@ mod read_tests {
     }
 }
 
+/// Tests of the batch/blob paths against a scripted, Firebird-shaped peer on a
+/// loopback socket (no real server, no database). The peer reproduces what
+/// server.cpp does for the ops involved: rows (and, at protocol 19, the
+/// op_inline_blob packets ahead of them) in answer to op_fetch; open /
+/// get_segment (segments framed `u16le len + bytes`, EOF reported through
+/// handle 2 — also for requests past EOF) / close served strictly in request
+/// order, each close answered at once. Pipelining falls out of that order.
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+    use rsfbclient_core::charset::UTF_8;
+    use std::collections::HashMap;
+    use std::io::BufReader;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Debug)]
+    enum Cell {
+        Int(i64),
+        Blob(Option<u64>),
+    }
+
+    /// One op_fetch answer: rows, then a terminator (0 = batch end, 100 = cursor end).
+    struct Batch {
+        rows: Vec<Vec<Cell>>,
+        status: u32,
+    }
+
+    #[derive(Default, Debug)]
+    struct Stats {
+        fetches: usize,
+        opens: usize,
+        segments: usize,
+        closes: usize,
+        inlined: usize,
+        commits: usize,
+    }
+
+    struct FakeServer {
+        blobs: HashMap<u64, Vec<u8>>,
+        batches: Vec<Batch>,
+        /// Largest framed blob inlined ahead of a row (0 = never, protocol < 19).
+        inline_size: usize,
+        /// Longest segment the fake engine stores (forces multi-segment responses).
+        seg_max: usize,
+        stats: Arc<Mutex<Stats>>,
+    }
+
+    fn read_u32(r: &mut impl Read) -> u32 {
+        let mut b = [0u8; 4];
+        r.read_exact(&mut b).expect("peer closed");
+        u32::from_be_bytes(b)
+    }
+
+    fn read_u64(r: &mut impl Read) -> u64 {
+        let mut b = [0u8; 8];
+        r.read_exact(&mut b).unwrap();
+        u64::from_be_bytes(b)
+    }
+
+    fn read_cstring(r: &mut impl Read) -> Vec<u8> {
+        let len = read_u32(r) as usize;
+        let padded = (len + 3) & !3;
+        let mut b = vec![0u8; padded];
+        r.read_exact(&mut b).unwrap();
+        b.truncate(len);
+        b
+    }
+
+    fn op_response(handle: u32, data: &[u8]) -> Vec<u8> {
+        let mut b = BytesMut::new();
+        b.put_u32(WireOp::Response as u32);
+        b.put_u32(handle);
+        b.put_u64(0);
+        b.put_wire_bytes(data);
+        b.put_u32(ibase::isc_arg_end);
+        b.to_vec()
+    }
+
+    fn op_error(gds_code: u32) -> Vec<u8> {
+        let mut b = BytesMut::new();
+        b.put_u32(WireOp::Response as u32);
+        b.put_u32(0);
+        b.put_u64(0);
+        b.put_wire_bytes(&[]);
+        b.put_u32(ibase::isc_arg_gds);
+        b.put_u32(gds_code);
+        b.put_u32(ibase::isc_arg_end);
+        b.to_vec()
+    }
+
+    fn frame(segments: &[&[u8]]) -> Vec<u8> {
+        let mut data = BytesMut::new();
+        for seg in segments {
+            data.put_u16_le(seg.len() as u16);
+            data.put_slice(seg);
+        }
+        data.to_vec()
+    }
+
+    impl FakeServer {
+        fn serve(mut self, stream: TcpStream) {
+            let mut rd = BufReader::new(stream.try_clone().unwrap());
+            let mut wr = stream;
+            // blob handle -> (blob id, read position)
+            let mut open: HashMap<u32, (u64, usize)> = HashMap::new();
+            let mut next_handle = 100u32;
+            let mut batches = self.batches.drain(..).collect::<Vec<_>>().into_iter();
+
+            loop {
+                let mut op = [0u8; 4];
+                if rd.read_exact(&mut op).is_err() {
+                    return; // client went away
+                }
+                let op = u32::from_be_bytes(op);
+
+                if op == WireOp::Fetch as u32 {
+                    let _stmt = read_u32(&mut rd);
+                    let _blr = read_cstring(&mut rd);
+                    let _msg = read_u32(&mut rd);
+                    let _count = read_u32(&mut rd);
+                    self.stats.lock().unwrap().fetches += 1;
+                    let batch = batches.next().expect("more op_fetch than scripted batches");
+                    let mut out = BytesMut::new();
+                    for row in &batch.rows {
+                        // Inline blobs ride ahead of the row that references them.
+                        for cell in row {
+                            if self.inline_size == 0 {
+                                break;
+                            }
+                            if let Cell::Blob(Some(id)) = cell {
+                                let Some(data) = self.blobs.get(id) else {
+                                    continue;
+                                };
+                                let framed = self.framed_whole(data);
+                                if framed.len() <= self.inline_size {
+                                    out.put_u32(WireOp::InlineBlob as u32);
+                                    out.put_u32(1); // transaction id
+                                    out.put_u64(*id);
+                                    out.put_wire_bytes(&[6, 4, 0, 0, 0, 0, 0, 1]);
+                                    out.put_wire_bytes(&framed);
+                                    self.stats.lock().unwrap().inlined += 1;
+                                }
+                            }
+                        }
+                        out.put_u32(WireOp::FetchResponse as u32);
+                        out.put_u32(0); // status
+                        out.put_u32(1); // messages
+                        let mut bitmap = vec![0u8; ((row.len() + 7) / 8 + 3) & !3];
+                        for (i, cell) in row.iter().enumerate() {
+                            if matches!(cell, Cell::Blob(None)) {
+                                bitmap[i / 8] |= 1 << (i % 8);
+                            }
+                        }
+                        out.put_slice(&bitmap);
+                        for cell in row {
+                            match cell {
+                                Cell::Int(v) => out.put_i64(*v),
+                                Cell::Blob(Some(id)) => out.put_u64(*id),
+                                Cell::Blob(None) => {}
+                            }
+                        }
+                    }
+                    out.put_u32(WireOp::FetchResponse as u32);
+                    out.put_u32(batch.status);
+                    out.put_u32(0);
+                    wr.write_all(&out).unwrap();
+                } else if op == WireOp::OpenBlob as u32 {
+                    let _tr = read_u32(&mut rd);
+                    let id = read_u64(&mut rd);
+                    self.stats.lock().unwrap().opens += 1;
+                    if self.blobs.contains_key(&id) {
+                        let h = next_handle;
+                        next_handle += 1;
+                        open.insert(h, (id, 0));
+                        wr.write_all(&op_response(h, &[])).unwrap();
+                    } else {
+                        wr.write_all(&op_error(335544329)).unwrap(); // invalid BLOB ID
+                    }
+                } else if op == WireOp::GetSegment as u32 {
+                    let h = read_u32(&mut rd);
+                    let mut buffer_length = read_u32(&mut rd) as usize;
+                    let _seg = read_cstring(&mut rd);
+                    self.stats.lock().unwrap().segments += 1;
+                    let (id, pos) = open.get_mut(&h).expect("get_segment on unknown handle");
+                    let data = &self.blobs[id];
+                    // rem_port::get_segment: pack segments while the buffer has room;
+                    // a getSegment that finds no data sets state 2 (EOF).
+                    let mut out = Vec::new();
+                    let mut state = 0u32;
+                    while buffer_length > 2 {
+                        buffer_length -= 2;
+                        if *pos >= data.len() {
+                            state = 2;
+                            break;
+                        }
+                        let take = (data.len() - *pos).min(self.seg_max).min(buffer_length);
+                        out.extend_from_slice(&(take as u16).to_le_bytes());
+                        out.extend_from_slice(&data[*pos..*pos + take]);
+                        *pos += take;
+                        buffer_length -= take;
+                    }
+                    wr.write_all(&op_response(state, &out)).unwrap();
+                } else if op == WireOp::CloseBlob as u32 {
+                    let h = read_u32(&mut rd);
+                    assert!(
+                        open.remove(&h).is_some(),
+                        "close of unknown blob handle {h}"
+                    );
+                    self.stats.lock().unwrap().closes += 1;
+                    wr.write_all(&op_response(0, &[])).unwrap(); // end_blob: never deferred
+                } else if op == WireOp::Commit as u32 {
+                    let _tr = read_u32(&mut rd);
+                    self.stats.lock().unwrap().commits += 1;
+                    assert!(open.is_empty(), "commit with blobs still open: {open:?}");
+                    wr.write_all(&op_response(0, &[])).unwrap();
+                } else {
+                    panic!("fake server: unexpected op {op}");
+                }
+            }
+        }
+
+        fn framed_whole(&self, data: &[u8]) -> Vec<u8> {
+            let segs: Vec<&[u8]> = data.chunks(self.seg_max.max(1)).collect();
+            frame(&segs)
+        }
+    }
+
+    /// Connects a client to `server` running on its own thread.
+    fn connect_to(server: FakeServer, version: ProtocolVersion) -> FirebirdWireConnection {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            server.serve(stream);
+        });
+        let socket = TcpStream::connect(addr).unwrap();
+        socket.set_nodelay(true).unwrap();
+
+        FirebirdWireConnection {
+            socket: FbStream::Plain(socket),
+            version,
+            buff: vec![0; READ_BUFFER_LEN].into_boxed_slice(),
+            pending: Bytes::new(),
+            lazy_count: 0,
+            inline_blob_size: if version >= ProtocolVersion::V19 {
+                65535
+            } else {
+                0
+            },
+            charset: UTF_8,
+            auth_plugin: None,
+            srp_key: [0; 32],
+            event_channel: None,
+            next_event_id: 1,
+        }
+    }
+
+    fn stmt(cols: &[(&str, i16)]) -> StmtHandleData {
+        let xsqlda: Vec<XSqlVar> = cols
+            .iter()
+            .map(|(name, subtype)| XSqlVar {
+                sqltype: if *subtype < 0 {
+                    ibase::SQL_INT64 as i16 + 1
+                } else {
+                    ibase::SQL_BLOB as i16 + 1
+                },
+                sqlsubtype: (*subtype).max(0),
+                alias_name: (*name).into(),
+                ..Default::default()
+            })
+            .collect();
+        StmtHandleData {
+            handle: StmtHandle(7),
+            xsqlda,
+            blr: Bytes::new(),
+            param_count: 0,
+            prefetched: VecDeque::new(),
+            cursor_eof: false,
+            has_blob: true,
+        }
+    }
+
+    fn text(c: &Column) -> &str {
+        match &c.value {
+            SqlType::Text(t) => t,
+            other => panic!("{}: expected text, got {other:?}", c.name),
+        }
+    }
+
+    fn binary(c: &Column) -> &[u8] {
+        match &c.value {
+            SqlType::Binary(b) => b,
+            other => panic!("{}: expected binary, got {other:?}", c.name),
+        }
+    }
+
+    fn fetch_all(conn: &mut FirebirdWireConnection, st: &mut StmtHandleData) -> Vec<Vec<Column>> {
+        let mut tr = TrHandle(1);
+        let mut rows = Vec::new();
+        while let Some(row) = conn.fetch(&mut tr, st).unwrap() {
+            rows.push(row);
+        }
+        rows
+    }
+
+    fn big(n: usize, seed: u8) -> Vec<u8> {
+        (0..n)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    /// `n` bytes of ASCII (valid in any charset) for text blobs.
+    fn big_text(n: usize) -> Vec<u8> {
+        (0..n).map(|i| b'a' + (i % 26) as u8).collect()
+    }
+
+    /// Text, binary, NULL, empty, multi-segment, exactly-one-buffer and
+    /// several-round-trip blobs across two batches, with the same blob id
+    /// used twice. Then a commit, which only succeeds if every lazily-closed
+    /// handle's response was consumed in order.
+    #[test]
+    fn batch_blobs_resolve_through_the_pipeline_and_leave_the_stream_in_sync() {
+        let stats = Arc::new(Mutex::new(Stats::default()));
+        let mut blobs = HashMap::new();
+        blobs.insert(1, "procedure source — ação".as_bytes().to_vec());
+        blobs.insert(2, big(200_000, 3)); // several 64 KiB rounds, share ramps 1→2→4
+        blobs.insert(3, big_text(65533)); // fills one buffer exactly: EOF only on the next request
+        blobs.insert(4, Vec::new()); // empty blob: EOF with no data
+        blobs.insert(5, big(70_000, 9)); // one byte more than a buffer
+        let server = FakeServer {
+            blobs,
+            batches: vec![
+                Batch {
+                    rows: vec![
+                        vec![Cell::Blob(Some(1)), Cell::Int(10), Cell::Blob(Some(2))],
+                        vec![Cell::Blob(None), Cell::Int(20), Cell::Blob(Some(4))],
+                        vec![Cell::Blob(Some(3)), Cell::Int(30), Cell::Blob(Some(5))],
+                    ],
+                    status: 0, // more batches follow
+                },
+                Batch {
+                    rows: vec![vec![Cell::Blob(Some(1)), Cell::Int(40), Cell::Blob(None)]],
+                    status: 100,
+                },
+            ],
+            inline_size: 0,
+            seg_max: 30_000,
+            stats: stats.clone(),
+        };
+        let mut conn = connect_to(server, ProtocolVersion::V13);
+        let mut st = stmt(&[("SRC", 1), ("N", -1), ("BIN", 0)]);
+
+        let rows = fetch_all(&mut conn, &mut st);
+        assert_eq!(rows.len(), 4);
+
+        assert_eq!(text(&rows[0][0]), "procedure source — ação");
+        assert!(matches!(rows[0][1].value, SqlType::Integer(10)));
+        assert_eq!(binary(&rows[0][2]), &big(200_000, 3)[..]);
+
+        assert!(rows[1][0].value.is_null());
+        assert_eq!(rows[1][0].raw_type, ibase::SQL_BLOB);
+        assert_eq!(binary(&rows[1][2]), &[] as &[u8]);
+
+        assert_eq!(text(&rows[2][0]).len(), 65533);
+        assert_eq!(text(&rows[2][0]).as_bytes(), &big_text(65533)[..]);
+        assert_eq!(binary(&rows[2][2]), &big(70_000, 9)[..]);
+
+        assert_eq!(text(&rows[3][0]), "procedure source — ação");
+        assert!(rows[3][2].value.is_null());
+
+        // The pending lazy close responses are skipped ahead of the commit's.
+        conn.transaction_operation(&mut TrHandle(1), TrOp::Commit)
+            .unwrap();
+
+        let s = stats.lock().unwrap();
+        assert_eq!(s.fetches, 2);
+        assert_eq!(s.opens, 6, "one open per non-NULL blob cell");
+        assert_eq!(s.closes, 6, "every handle closed");
+        assert_eq!(s.commits, 1);
+        // 200 000 B → 4 data responses (64 KiB each) + over-reads from the ramp;
+        // 65 533 B → 1 data + 1 EOF; 70 000 → 2; empty → 1; text → 1 (×2).
+        assert!(s.segments >= 6 + 4, "{s:?}");
+        assert!(s.segments <= 24, "runaway over-reading: {s:?}");
+    }
+
+    /// Protocol 19: blobs the server inlines cost no open/get_segment/close at
+    /// all; those over the announced size go through the pipeline.
+    #[test]
+    fn inlined_blobs_skip_the_blob_round_trips() {
+        let stats = Arc::new(Mutex::new(Stats::default()));
+        let mut blobs = HashMap::new();
+        blobs.insert(1, "memo".as_bytes().to_vec());
+        blobs.insert(2, big(100_000, 1)); // over 65535 framed: not inlined
+        blobs.insert(4, Vec::new());
+        let server = FakeServer {
+            blobs,
+            batches: vec![Batch {
+                rows: vec![
+                    vec![Cell::Blob(Some(1)), Cell::Blob(Some(2))],
+                    vec![Cell::Blob(Some(4)), Cell::Blob(None)],
+                ],
+                status: 100,
+            }],
+            inline_size: 65535,
+            seg_max: 65535,
+            stats: stats.clone(),
+        };
+        let mut conn = connect_to(server, ProtocolVersion::V19);
+        let mut st = stmt(&[("MEMO", 1), ("DOC", 0)]);
+
+        let rows = fetch_all(&mut conn, &mut st);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(text(&rows[0][0]), "memo");
+        assert_eq!(binary(&rows[0][1]), &big(100_000, 1)[..]);
+        assert_eq!(text(&rows[1][0]), "");
+        assert!(rows[1][1].value.is_null());
+
+        conn.transaction_operation(&mut TrHandle(1), TrOp::Commit)
+            .unwrap();
+
+        let s = stats.lock().unwrap();
+        assert_eq!(s.inlined, 2, "memo and the empty blob were inlined");
+        assert_eq!(
+            s.opens, 1,
+            "only the 100 KB blob went through open/get_segment/close"
+        );
+        assert_eq!(s.closes, 1);
+    }
+
+    /// A server error on one blob of the window (here an invalid id) fails the
+    /// fetch, but every outstanding response is drained and the opened handles
+    /// closed, so the connection keeps working.
+    #[test]
+    fn a_blob_error_is_reported_and_the_connection_stays_usable() {
+        let stats = Arc::new(Mutex::new(Stats::default()));
+        let mut blobs = HashMap::new();
+        blobs.insert(1, "ok".as_bytes().to_vec());
+        blobs.insert(3, big(70_000, 2));
+        let server = FakeServer {
+            blobs,
+            batches: vec![
+                Batch {
+                    rows: vec![
+                        vec![Cell::Blob(Some(1))],
+                        vec![Cell::Blob(Some(99))], // unknown id → invalid BLOB ID on open
+                        vec![Cell::Blob(Some(3))],
+                    ],
+                    status: 0,
+                },
+                Batch {
+                    rows: vec![vec![Cell::Blob(Some(1))]],
+                    status: 100,
+                },
+            ],
+            inline_size: 0,
+            seg_max: 65535,
+            stats: stats.clone(),
+        };
+        let mut conn = connect_to(server, ProtocolVersion::V13);
+        let mut st = stmt(&[("SRC", 1)]);
+        let mut tr = TrHandle(1);
+
+        let err = conn.fetch(&mut tr, &mut st).unwrap_err().to_string();
+        assert!(err.contains("invalid BLOB ID"), "{err}");
+
+        // Next batch: served correctly, nothing left over from the failed one.
+        let row = conn.fetch(&mut tr, &mut st).unwrap().expect("a row");
+        assert_eq!(text(&row[0]), "ok");
+        assert!(conn.fetch(&mut tr, &mut st).unwrap().is_none());
+        conn.transaction_operation(&mut tr, TrOp::Commit).unwrap();
+
+        let s = stats.lock().unwrap();
+        assert_eq!(s.opens, 4);
+        assert_eq!(
+            s.closes, 3,
+            "the two handles that did open, plus the second batch's"
+        );
+        assert_eq!(s.commits, 1);
+    }
+}
+
 #[test]
 #[ignore]
 fn connection_test() {

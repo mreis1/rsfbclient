@@ -27,6 +27,11 @@ type RustStmtHandle = StmtHandle;
 
 /// How many rows to request per op_fetch (round-trip). Configurable via
 /// FB_FETCH_BATCH; defaults to 200. The crate originally used 1 (one row per round-trip).
+///
+/// The server may end a batch earlier than requested (it stops after
+/// MAX_PACKETS_PER_BATCH = 16 of its send buffers once at least 10 rows went
+/// out), so a bigger value is a ceiling, not a promise — and the whole batch is
+/// buffered in memory before rows are handed out.
 fn fetch_batch_size() -> u32 {
     env::var("FB_FETCH_BATCH")
         .ok()
@@ -34,6 +39,41 @@ fn fetch_batch_size() -> u32 {
         .filter(|&n| n > 0)
         .unwrap_or(200)
 }
+
+/// Highest wire protocol version offered to the server (10..=19), defaults to
+/// 19. `FB_MAX_PROTOCOL=13` is the escape hatch back to the pre-fork
+/// negotiation (Firebird 3+ then stays at protocol 13: no inline blobs, but
+/// also none of the version-gated execute fields).
+fn max_protocol() -> u16 {
+    env::var("FB_MAX_PROTOCOL")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .map(|n| n.clamp(10, 19))
+        .unwrap_or(19)
+}
+
+/// Largest blob (data + 2-byte segment framing) the server may inline with a
+/// row at protocol 19+. Defaults to the protocol maximum, 65535 — the same
+/// default as fbclient's `MaxInlineBlobSize`. `FB_INLINE_BLOB_SIZE=0`
+/// disables inlining; the pipelined open/get_segment/close path then handles
+/// every blob.
+fn inline_blob_size() -> u32 {
+    env::var("FB_INLINE_BLOB_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .map(|n| n.min(BLOB_SEGMENT_BUFFER))
+        .unwrap_or(BLOB_SEGMENT_BUFFER)
+}
+
+/// Blobs opened per pipelined round in `resolve_blobs`. Each open blob holds
+/// a server-side segment buffer of up to `BLOB_SEGMENT_BUFFER` bytes, so this
+/// bounds server memory to ~2 MiB per connection while still amortising one
+/// round trip over 32 blobs.
+const BLOB_OPEN_WINDOW: usize = 32;
+
+/// Max `op_get_segment` requests in flight in one round of `resolve_blobs`
+/// (~2 MiB of responses). Same depth as fast-firebird's segment pipeline.
+const BLOB_SEGMENT_WINDOW: usize = 32;
 
 /// Size of the scratch buffer for a single socket read. Batch fetch pulls many
 /// rows per op_fetch, so a bigger read cuts read syscalls and, more importantly,
@@ -107,6 +147,10 @@ pub struct FirebirdWireConnection {
 
     /// Lazy responses to read
     lazy_count: u32,
+
+    /// Max blob size the server may inline with rows (protocol 19+), as sent
+    /// in every op_execute. 0 when the protocol or the user turned it off.
+    inline_blob_size: u32,
 
     pub(crate) charset: Charset,
 
@@ -430,7 +474,14 @@ impl FirebirdWireConnection {
         // Random key for the srp
         let srp_key: [u8; 32] = rand::random();
 
-        let req = connect(db_name, user, &username, &hostname, &srp_key);
+        let req = connect(
+            db_name,
+            user,
+            &username,
+            &hostname,
+            &srp_key,
+            max_protocol(),
+        );
         socket.write_all(&req)?;
         socket.flush()?;
 
@@ -534,12 +585,21 @@ impl FirebirdWireConnection {
             }
         }
 
+        // Inline blobs exist from protocol 19 on; an older server would reject
+        // the extra op_execute field, so the size is only announced there.
+        let inline_blob_size = if version >= ProtocolVersion::V19 {
+            inline_blob_size()
+        } else {
+            0
+        };
+
         Ok(Self {
             socket,
             version,
             buff,
             pending,
             lazy_count: 0,
+            inline_blob_size,
             charset,
             auth_plugin: if continue_auth {
                 // Already authenticated
@@ -982,6 +1042,8 @@ impl FirebirdWireConnection {
             stmt_handle.handle.0,
             &params.blr,
             &params.values,
+            self.version,
+            self.inline_blob_size,
         ))?;
         self.socket.flush()?;
 
@@ -1028,6 +1090,8 @@ impl FirebirdWireConnection {
             &params.blr,
             &params.values,
             &stmt_handle.blr,
+            self.version,
+            self.inline_blob_size,
         ))?;
         self.socket.flush()?;
 
@@ -1041,7 +1105,12 @@ impl FirebirdWireConnection {
             &mut self.pending,
             &mut self.lazy_count,
             |resp, lazy_count| {
+                // Protocol 19+: the server may inline the row's blobs first.
+                // Collected per attempt — `read_with` may re-run this closure
+                // from the start of the buffer when the response is incomplete.
+                let mut inline = Vec::new();
                 let op_code = skip_lazy_responses(resp, lazy_count)?;
+                let op_code = read_inline_blobs(resp, op_code, &mut inline)?;
 
                 if op_code == WireOp::Response as u32 {
                     // An error ocurred
@@ -1052,7 +1121,7 @@ impl FirebirdWireConnection {
                     return err_conn_rejected(op_code);
                 }
 
-                let parsed_cols = parse_sql_response(resp, xsqlda, version, &charset)?;
+                let parsed_cols = parse_sql_response(resp, xsqlda, version, &charset, &inline)?;
 
                 // The sql response is followed by its own op_response, framed with
                 // its own op_code just like every other response on the wire.
@@ -1069,13 +1138,9 @@ impl FirebirdWireConnection {
         // Only now, with the response above fully consumed, is it safe to run the
         // extra round-trips a blob column needs: issuing them earlier would read
         // the blob replies from behind the still-unparsed bytes of this response.
-        let mut cols = Vec::with_capacity(parsed_cols.len());
+        let mut rows = self.resolve_blobs(tr_handle, vec![parsed_cols])?;
 
-        for pc in parsed_cols {
-            cols.push(pc.into_column(self, tr_handle)?);
-        }
-
-        Ok(cols)
+        Ok(rows.pop().unwrap_or_default())
     }
 
     /// Fetch ONE row. Served from a buffer filled in batches: when the buffer
@@ -1228,15 +1293,188 @@ impl FirebirdWireConnection {
 
         stmt_handle.cursor_eof = cursor_eof;
 
-        for parsed in rows {
-            let mut cols = Vec::with_capacity(parsed.len());
-            for pc in parsed {
-                cols.push(pc.into_column(self, tr_handle)?);
-            }
-            stmt_handle.prefetched.push_back(cols);
-        }
+        // All blobs of the batch in a few pipelined round trips, instead of
+        // open + get_segment… + close per blob.
+        stmt_handle
+            .prefetched
+            .extend(self.resolve_blobs(tr_handle, rows)?);
 
         Ok(())
+    }
+
+    /// Completes the blob columns of a batch of parsed rows.
+    ///
+    /// Serially a blob costs open + N×get_segment + close, each a round trip —
+    /// on a remote link that dominated everything else (a metadata scan of a
+    /// few thousand objects took minutes). Here the blobs of the whole batch
+    /// are driven through a pipeline, `BLOB_OPEN_WINDOW` at a time:
+    ///
+    /// 1. every `op_open_blob` of the window goes out in one write, then the
+    ///    responses are read back in order (1 round trip for 32 blobs);
+    /// 2. one `op_get_segment` per open blob, again one write, responses in
+    ///    order; blobs that did not reach EOF get a growing share of
+    ///    `BLOB_SEGMENT_WINDOW` requests in the next round (1 round trip per
+    ///    round, however many blobs it covers). Requests past EOF are safe:
+    ///    the server answers them with a clean, empty EOF response;
+    /// 3. `op_close_blob` is written for each handle but its response is left
+    ///    pending (`lazy_count`): the server replies at once and
+    ///    `skip_lazy_responses` consumes it ahead of the next real response,
+    ///    so closes ride for free.
+    ///
+    /// Responses arrive strictly in request order, so a plain FIFO over the
+    /// pipelined requests keeps the stream in sync. On a server error every
+    /// outstanding response is still read, so the connection stays usable.
+    fn resolve_blobs(
+        &mut self,
+        tr_handle: &mut TrHandle,
+        rows: Vec<Vec<ParsedColumn>>,
+    ) -> Result<Vec<Vec<Column>>, FbError> {
+        /// A blob cell waiting for its data
+        struct Pending {
+            row: usize,
+            col: usize,
+            binary: bool,
+            id: BlobId,
+        }
+
+        let mut pending: Vec<Pending> = Vec::new();
+        let mut out: Vec<Vec<Column>> = Vec::with_capacity(rows.len());
+
+        for (row, parsed) in rows.into_iter().enumerate() {
+            let mut cols = Vec::with_capacity(parsed.len());
+            for (col, pc) in parsed.into_iter().enumerate() {
+                match pc {
+                    ParsedColumn::Complete(c) => cols.push(c),
+                    ParsedColumn::Blob {
+                        binary,
+                        id,
+                        col_name,
+                    } => {
+                        pending.push(Pending {
+                            row,
+                            col,
+                            binary,
+                            id,
+                        });
+                        // Placeholder, filled below.
+                        cols.push(Column::new(col_name, ibase::SQL_BLOB, SqlType::Null));
+                    }
+                }
+            }
+            out.push(cols);
+        }
+
+        for window in pending.chunks(BLOB_OPEN_WINDOW) {
+            // 1. Open every blob of the window in one round trip.
+            let mut req = BytesMut::with_capacity(16 * window.len());
+            for p in window {
+                req.put(open_blob(tr_handle.0, p.id.0));
+            }
+            self.socket.write_all(&req)?;
+            self.socket.flush()?;
+
+            let mut first_err: Option<FbError> = None;
+            let mut handles: Vec<Option<BlobHandle>> = Vec::with_capacity(window.len());
+            for _ in window {
+                match self.read_response() {
+                    Ok(resp) => handles.push(Some(BlobHandle(resp.handle))),
+                    Err(e) => {
+                        handles.push(None);
+                        first_err.get_or_insert(e);
+                    }
+                }
+            }
+
+            // 2. Segment rounds until every open blob reached EOF.
+            let mut data: Vec<Vec<u8>> = vec![Vec::new(); window.len()];
+            let mut eof: Vec<bool> = handles.iter().map(|h| h.is_none()).collect();
+            // Requests per blob in the next round: 1 for an unknown blob,
+            // doubled (up to the window) each time a blob consumes its whole
+            // share without hitting EOF — big blobs stream many segments per
+            // round trip, small blobs cost no over-reads.
+            let mut share: Vec<usize> = vec![1; window.len()];
+
+            loop {
+                let mut plan: Vec<usize> = Vec::new(); // blob index per request, in order
+                let mut budget = BLOB_SEGMENT_WINDOW;
+                for (i, &done) in eof.iter().enumerate() {
+                    if done || budget == 0 {
+                        continue;
+                    }
+                    let n = share[i].min(budget);
+                    plan.extend(std::iter::repeat(i).take(n));
+                    budget -= n;
+                }
+                if plan.is_empty() {
+                    break;
+                }
+
+                let mut req = BytesMut::with_capacity(16 * plan.len());
+                for &i in &plan {
+                    let handle = handles[i].expect("planned segment for an unopened blob");
+                    req.put(get_segment(handle.0, BLOB_SEGMENT_BUFFER));
+                }
+                self.socket.write_all(&req)?;
+                self.socket.flush()?;
+
+                let mut got: Vec<usize> = vec![0; window.len()];
+                for &i in &plan {
+                    match self.read_response() {
+                        Ok(resp) => {
+                            if eof[i] {
+                                // Over-read past EOF: clean empty response, nothing to keep.
+                                continue;
+                            }
+                            // handle == 2 (isc_segstr_eof): no more data after this.
+                            let end = resp.handle == 2;
+                            match unframe_segments(resp.data) {
+                                Ok(segment) => data[i].extend_from_slice(&segment),
+                                Err(e) => {
+                                    eof[i] = true;
+                                    first_err.get_or_insert(e);
+                                    continue;
+                                }
+                            }
+                            if end {
+                                eof[i] = true;
+                            } else {
+                                got[i] += 1;
+                            }
+                        }
+                        Err(e) => {
+                            eof[i] = true;
+                            first_err.get_or_insert(e);
+                        }
+                    }
+                }
+
+                for i in 0..window.len() {
+                    if !eof[i] && got[i] >= share[i] {
+                        share[i] = (share[i] * 2).min(BLOB_SEGMENT_WINDOW);
+                    }
+                }
+            }
+
+            // 3. Close the handles; the responses are consumed lazily.
+            for handle in handles.iter().flatten() {
+                self.close_blob_lazy(*handle)?;
+            }
+
+            if let Some(e) = first_err {
+                return Err(e);
+            }
+
+            for (k, p) in window.iter().enumerate() {
+                let bytes = std::mem::take(&mut data[k]);
+                out[p.row][p.col].value = if p.binary {
+                    SqlType::Binary(bytes)
+                } else {
+                    SqlType::Text(self.charset.decode(bytes)?)
+                };
+            }
+        }
+
+        Ok(out)
     }
 
     /// Streaming fetch that decodes each row straight into a reusable
@@ -1361,7 +1599,10 @@ impl FirebirdWireConnection {
         Ok(())
     }
 
-    /// Open a blob, returning the blob handle
+    /// Open a blob, returning the blob handle.
+    ///
+    /// Single-blob reference path; batches go through `resolve_blobs`.
+    #[allow(dead_code)]
     pub fn open_blob(
         &mut self,
         tr_handle: &mut TrHandle,
@@ -1375,29 +1616,20 @@ impl FirebirdWireConnection {
         Ok(BlobHandle(resp.handle))
     }
 
-    /// Get a blob segment, returns the bytes and true if there is more data
+    /// Get a blob segment, returns the bytes and true if there is more data.
+    /// Requests the protocol-maximum 64 KiB per round trip.
+    ///
+    /// Single-blob reference path; batches go through `resolve_blobs`.
+    #[allow(dead_code)]
     pub fn get_segment(&mut self, blob_handle: BlobHandle) -> Result<(Bytes, bool), FbError> {
-        self.socket.write_all(&get_segment(blob_handle.0))?;
+        self.socket
+            .write_all(&get_segment(blob_handle.0, BLOB_SEGMENT_BUFFER))?;
         self.socket.flush()?;
 
-        let mut blob_data = BytesMut::with_capacity(256);
-
         let resp = self.read_response()?;
-        let mut data = resp.data;
+        let blob_data = unframe_segments(resp.data)?;
 
-        loop {
-            if data.remaining() < 2 {
-                break;
-            }
-            let len = data.get_u16_le()? as usize;
-            if data.remaining() < len {
-                return err_invalid_response();
-            }
-            blob_data.put_slice(&data[..len]);
-            data.advance(len)?;
-        }
-
-        Ok((blob_data.freeze(), resp.handle == 2))
+        Ok((blob_data, resp.handle == 2))
     }
 
     /// Closes a blob handle
@@ -1406,6 +1638,17 @@ impl FirebirdWireConnection {
         self.socket.flush()?;
 
         self.read_response()?;
+
+        Ok(())
+    }
+
+    /// Closes a blob handle without waiting for the answer. The server sends
+    /// the op_response for a close immediately (`end_blob` never defers it),
+    /// so it is consumed as a lazy response ahead of the next read — same
+    /// mechanism as `free_statement`.
+    fn close_blob_lazy(&mut self, blob_handle: BlobHandle) -> Result<(), FbError> {
+        self.socket.write_all(&close_blob(blob_handle.0))?;
+        self.lazy_count += 1;
 
         Ok(())
     }
@@ -1489,6 +1732,23 @@ fn next_op_code(resp: &mut Bytes) -> Result<u32, FbError> {
     }
 }
 
+/// Consumes the `op_inline_blob` packets (protocol 19+) the server sends ahead
+/// of a row, collecting them into `inline`, and returns the op code of the
+/// packet that follows them. `op_code` is the code already read; it is handed
+/// back untouched when it is not an inline blob.
+fn read_inline_blobs(
+    resp: &mut Bytes,
+    mut op_code: u32,
+    inline: &mut Vec<InlineBlob>,
+) -> Result<u32, FbError> {
+    while op_code == WireOp::InlineBlob as u32 {
+        inline.push(parse_inline_blob(resp)?);
+        op_code = next_op_code(resp)?;
+    }
+
+    Ok(op_code)
+}
+
 /// Consumes the lazy responses pending before the response we actually want.
 fn skip_lazy_responses(resp: &mut Bytes, lazy_count: &mut u32) -> Result<u32, FbError> {
     let mut op_code = next_op_code(resp)?;
@@ -1515,14 +1775,19 @@ fn parse_one_fetch_response(
     version: ProtocolVersion,
     charset: &Charset,
 ) -> Result<FetchOne<Vec<ParsedColumn>>, FbError> {
-    match frame_fetch_response(resp, lazy_count)? {
+    // Blobs the server inlined ahead of this row (protocol 19+). Fresh per
+    // attempt: `read_with` re-runs the parse from the start of the buffer
+    // when the response turns out incomplete.
+    let mut inline = Vec::new();
+
+    match frame_fetch_response(resp, lazy_count, &mut inline)? {
         Framed::End => return Ok(FetchOne::End),
         Framed::BatchEnd => return Ok(FetchOne::BatchEnd),
         Framed::Row => {}
     }
 
     // Delegate to the crate parser (re-reads status+messages+data).
-    match parse_fetch_response(resp, xsqlda, version, charset)? {
+    match parse_fetch_response(resp, xsqlda, version, charset, &inline)? {
         Some(parsed) => Ok(FetchOne::Row(parsed)),
         None => Ok(FetchOne::End),
     }
@@ -1537,7 +1802,8 @@ fn parse_one_fetch_response_columns(
     version: ProtocolVersion,
     charset: &Charset,
 ) -> Result<FetchOne<Vec<Column>>, FbError> {
-    match frame_fetch_response(resp, lazy_count)? {
+    // Blob-free statement: the server never inlines anything for it.
+    match frame_fetch_response(resp, lazy_count, &mut Vec::new())? {
         Framed::End => return Ok(FetchOne::End),
         Framed::BatchEnd => return Ok(FetchOne::BatchEnd),
         Framed::Row => {}
@@ -1558,7 +1824,8 @@ fn parse_one_fetch_response_raw(
     version: ProtocolVersion,
     out: &mut Vec<RawValue>,
 ) -> Result<Framed, FbError> {
-    match frame_fetch_response(resp, lazy_count)? {
+    // Blob-free statement: the server never inlines anything for it.
+    match frame_fetch_response(resp, lazy_count, &mut Vec::new())? {
         Framed::End => Ok(Framed::End),
         Framed::BatchEnd => Ok(Framed::BatchEnd),
         Framed::Row => {
@@ -1574,8 +1841,13 @@ fn parse_one_fetch_response_raw(
 /// Frames ONE op_fetch_response: consumes the response when it carries no row,
 /// and leaves `resp` at the start of the body when it does, so the caller can
 /// decode the row the way it needs.
-fn frame_fetch_response(resp: &mut Bytes, lazy_count: &mut u32) -> Result<Framed, FbError> {
+fn frame_fetch_response(
+    resp: &mut Bytes,
+    lazy_count: &mut u32,
+    inline: &mut Vec<InlineBlob>,
+) -> Result<Framed, FbError> {
     let op_code = skip_lazy_responses(resp, lazy_count)?;
+    let op_code = read_inline_blobs(resp, op_code, inline)?;
 
     if op_code == WireOp::Response as u32 {
         // Error reported by the server
